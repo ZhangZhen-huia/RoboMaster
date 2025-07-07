@@ -1,0 +1,262 @@
+#include "trig_task.h"
+#include "tim.h"
+#include "communicate_task.h"
+#include "detect_task.h"
+#include "key_task.h"
+
+int64_t  trig_ecd_sum=0;
+fp32 angle_target;
+uint8_t fire_flag = 1,last_fire_flag=0;
+shoot_control_t trig_control;
+
+static void trig_init(shoot_control_t *shoot_init);
+
+static void trig_feedback_update(shoot_control_t *feedback_update);
+static void trig_motor_speed_set(shoot_control_t * control_loop);
+static void trig_motor_pid_cal(shoot_control_t * control_loop);
+static fp32 trig_block_detect_Serial(shoot_control_t * control_loop);//连发
+static void trig_block_detect_single(shoot_control_t * control_loop,fp32 *angle_set);//单发
+
+bool_t trig_detect(void);
+
+
+
+void trig_task(void const * argument)
+{
+		vTaskDelay(TRIG_TASK_INIT_TIME);
+
+    trig_init(&trig_control);
+
+		
+		/*-- 判断拨弹盘2006电机是否在线 --*/
+		while(trig_detect())
+		{
+			vTaskDelay(TRIG_TASK_CONTROL_TIME);
+		}
+		while(1)
+		{
+			trig_feedback_update(&trig_control);			//发射电机数据更新
+			trig_motor_speed_set(&trig_control);				//堵转检测+pid输出
+			trig_motor_pid_cal(&trig_control);
+			
+
+			
+			if (POWER_OFF)
+      {
+				CAN_cmd_trig(0);
+
+      }
+      else
+      {
+				
+				CAN_cmd_trig(trig_control.shoot_trig_motor.current_set);
+      }
+			osDelay(1);
+		
+		}
+
+
+
+}
+
+
+/**
+	* @brief          发射机构初始化
+  * @param[out]     shoot_init:"shoot_control"变量指针.
+  * @retval         none
+  */
+static void trig_init(shoot_control_t *shoot_init)
+{
+	static const fp32 Shoot_trig_speed_pid_cascade[3] = {TRIG_SPEED_PID_KP_CASCADE,TRIG_SPEED_PID_KI_CASCADE,TRIG_SPEED_PID_KD_CASCADE};
+	static const fp32 Shoot_trig_angle_pid_cascade[3] = {TRIG_ANGLE_PID_KP_CASCADE,TRIG_ANGLE_PID_KI_CASCADE,TRIG_ANGLE_PID_KD_CASCADE};
+	static const fp32 Shoot_trig_speed_pid_single[3]	= {TRIG_SPEED_PID_KP_SINGLE,TRIG_SPEED_PID_KI_SINGLE,TRIG_SPEED_PID_KD_SINGLE};
+	
+	shoot_init->shoot_trig_motor.shoot_motor_measure = get_gimbal_trigger_motor_measure_point();
+	
+	//遥控器数据指针获取
+	shoot_init->rc_data = get_gimbal_rc_data_point();
+	shoot_init->trig_referee = get_referee_data_point();
+
+		//初始化Trig电机速度pid
+	PID_init(&shoot_init->shoot_trig_motor.shoot_speed_pid_cascade,DATA_NORMAL,Shoot_trig_speed_pid_cascade,TRIG_SPEED_PID_MAX_OUT_CASCADE,TRIG_SPEED_PID_MAX_IOUT_CASCADE,NONE);
+	PID_init(&shoot_init->shoot_trig_motor.shoot_angle_pid_cascade,DATA_NORMAL,Shoot_trig_angle_pid_cascade,TRIG_ANGLE_PID_MAX_OUT_CASCADE,TRIG_ANGLE_PID_MAX_IOUT_CASCADE,NONE);
+	
+	PID_init(&shoot_init->shoot_trig_motor.shoot_speed_pid_single,DATA_NORMAL,Shoot_trig_speed_pid_single,TRIG_SPEED_PID_MAX_OUT_SINGLE,TRIG_SPEED_PID_MAX_OUT_SINGLE,NONE);
+	
+	shoot_init->trig_fire_mode = Serial_fire;//Single_fire;
+	
+	trig_feedback_update(shoot_init);
+}
+
+
+static void trig_feedback_update(shoot_control_t *feedback_update)
+{
+	static int16_t trig_ecd_error;
+	
+	//拨弹盘过零检测
+	trig_ecd_error = feedback_update->shoot_trig_motor.shoot_motor_measure->ecd -feedback_update->shoot_trig_motor.shoot_motor_measure->last_ecd;
+	trig_ecd_error = trig_ecd_error >  4095 ?   trig_ecd_error - 8191 : trig_ecd_error;
+	trig_ecd_error = trig_ecd_error < -4095 ?   trig_ecd_error + 8191 : trig_ecd_error;
+	trig_ecd_sum += trig_ecd_error;
+	
+	feedback_update->shoot_trig_motor.motor_angle = trig_ecd_sum/8191.0f*3.1415926f/36.0f;
+	feedback_update->shoot_trig_motor.motor_speed = feedback_update->shoot_trig_motor.shoot_motor_measure->rpm*TRIG_RPM_TO_SPEED_SEN;
+
+}
+
+
+
+
+
+/**
+  * @brief          拨弹盘输出 + 堵转检测
+  * @param[out]     control_loop:"shoot_control"变量指针.
+  * @retval         none static
+  */
+static void trig_motor_speed_set(shoot_control_t * control_loop)
+{	 
+	static uint8_t mode_flag;
+	if(Key_ScanValue.Key_Value.Q)
+	{
+		if(++mode_flag==2)mode_flag = 0;
+		if(mode_flag==0)control_loop->trig_fire_mode = Serial_fire;
+		else control_loop->trig_fire_mode = Single_fire;
+	}
+			/*不同发射模式下的目标值设定*/
+		if(control_loop->trig_fire_mode == Serial_fire)//Serial_fire
+		{
+			control_loop->shoot_trig_motor.motor_speed_set = trig_block_detect_Serial(control_loop);//TRIG_BASE_SPEED;
+		}
+		else if(control_loop->trig_fire_mode == Single_fire)
+		{
+			trig_block_detect_single(control_loop,&angle_target);
+		}
+	if(gimbal_data.FireFlag==0)
+	{
+		control_loop->shoot_trig_motor.motor_speed_set = 0;
+		trig_ecd_sum = 0;
+		angle_target = 0;
+	}
+	
+}
+
+/*-- PID计算 --*/
+static void trig_motor_pid_cal(shoot_control_t * control_loop)
+{
+	
+	if(control_loop->trig_fire_mode == Serial_fire)//Serial_fire
+	{
+		control_loop->shoot_trig_motor.current_set = PID_calc(&control_loop->shoot_trig_motor.shoot_speed_pid_single,control_loop->shoot_trig_motor.motor_speed,control_loop->shoot_trig_motor.motor_speed_set);
+	}
+	else if(control_loop->trig_fire_mode == Single_fire)
+	{
+		PID_calc(&control_loop->shoot_trig_motor.shoot_angle_pid_cascade,angle_target,-control_loop->shoot_trig_motor.motor_angle);
+		control_loop->shoot_trig_motor.current_set = PID_calc(&control_loop->shoot_trig_motor.shoot_speed_pid_cascade,control_loop->shoot_trig_motor.motor_speed,control_loop->shoot_trig_motor.shoot_angle_pid_cascade.out);
+	}
+}
+//单发模式
+static void trig_block_detect_single(shoot_control_t * control_loop,fp32 *angle_set)
+{
+	if(control_loop->Fire)
+	{
+		/*-- 收到开火标志位 --*/
+		if(gimbal_data.FireFlag==1)
+		{
+				if(fire_flag)
+				{
+					*angle_set = -control_loop->shoot_trig_motor.motor_angle -0.8f;// 
+					fire_flag = 0;
+				}
+		}
+		else if(gimbal_data.FireFlag==0)
+		{
+			fire_flag = 1;
+		}
+	}
+		/*-- 遥控器掉线 --*/
+	if(POWER_OFF)
+		*angle_set=0;
+}
+
+//连发模式
+static fp32 trig_block_detect_Serial(shoot_control_t * control_loop)
+{
+	static fp32 trig_speed_set,temp_speed;
+	static int16_t   NoMove_counter;
+	static uint8_t   NoMove_flag;
+	
+	//拨弹盘转一圈拨出去8个
+	//2006减速比为36:1
+	//rpm/60/36 为拨弹盘一秒转的圈数
+	//*8等于一秒发弹
+	//开火
+
+	/*-- 遥控器掉线 --*/
+	if(POWER_OFF)
+		trig_speed_set = 0;
+	
+	if(control_loop->Fire)
+	{
+
+		/*-- 爆发阶段 --*/
+		if(control_loop->ultimate_explosion)
+			trig_speed_set = TRIG_EXPLOSION_SPEED;/*-- 30发每秒 --*/
+		else 
+			trig_speed_set = TRIG_BASE_SPEED;			/*-- 15发每秒 --*/
+		
+		temp_speed = trig_speed_set;
+		
+		/*-- 收到开火标志位 --*/
+		if(gimbal_data.FireFlag)
+		{
+			/*-- 正常转动 --*/
+			if(control_loop->shoot_trig_motor.shoot_motor_measure->rpm >STANDARD_NOMOVE_RPM && NoMove_flag ==0)
+			{
+				trig_speed_set = temp_speed;
+				NoMove_counter =0;
+			}
+			
+			/*-- 卡弹转动 --*/
+			else if( control_loop->shoot_trig_motor.shoot_motor_measure->rpm <= STANDARD_NOMOVE_RPM && NoMove_flag ==0 )
+			{
+				trig_speed_set = temp_speed;						
+				NoMove_counter ++;
+				if( NoMove_counter >= STANDARD_NOMOVE_TIME ) 
+				{
+					NoMove_flag = 1;
+					NoMove_counter = STANDARD_REMOVE_TIME;
+				}	
+			}
+			/*-- 反向转动 --*/
+			else if( NoMove_flag != 0)
+			{
+				trig_speed_set =-TRIG_BACK_SPEED;
+				
+				NoMove_counter--;
+				
+				if(NoMove_counter <= 0)
+				{
+				NoMove_flag = 0;
+				NoMove_counter = 0;
+				}
+			}
+		}
+		
+		/*-- 没有收到开火标志位 --*/
+		else 
+		{
+				trig_speed_set = 0;
+		}
+	}
+	else
+		trig_speed_set = 0;
+	return trig_speed_set;
+}
+
+
+
+
+bool_t trig_detect(void)
+{
+	return toe_is_error(TRIGGER_MOTOR_TOE);
+}
